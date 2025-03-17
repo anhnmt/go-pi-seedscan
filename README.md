@@ -1,0 +1,1 @@
+# `go-pi-seedscan` – Scan and find the correct Seed Phrase
