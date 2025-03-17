@@ -1,1 +1,2 @@
-# `go-pi-seedscan` – Scan and find the correct Seed Phrase
+# go-pi-seedscan
+Recover and Validate Missing Seed Phrase for Pi Network
