@@ -2,10 +2,10 @@ package main
 
 import (
 	"encoding/hex"
-	"fmt"
 
 	"github.com/stellar/go/exp/crypto/derivation"
 	"github.com/stellar/go/keypair"
+	"github.com/stellar/go/support/errors"
 	"github.com/tyler-smith/go-bip39"
 )
 
@@ -17,7 +17,7 @@ func getPiWallet(seedPhrase, derivationPath string) (string, string, error) {
 	// Dẫn xuất key theo đường dẫn được truyền vào
 	derivedKey, err := derivation.DeriveForPath(derivationPath, seed)
 	if err != nil {
-		return "", "", fmt.Errorf("Lỗi dẫn xuất key: %v", err)
+		return "", "", errors.Errorf("Lỗi dẫn xuất key: %v", err)
 	}
 
 	// Lấy 32 byte đầu tiên làm seed cho Ed25519
@@ -30,7 +30,7 @@ func getPiWallet(seedPhrase, derivationPath string) (string, string, error) {
 	// Tạo Stellar Keypair (Pi Network)
 	kp, err := keypair.FromRawSeed(ed25519Seed)
 	if err != nil {
-		return "", "", fmt.Errorf("Lỗi tạo keypair Stellar: %v", err)
+		return "", "", errors.Errorf("Lỗi tạo keypair Stellar: %v", err)
 	}
 
 	return privateKeyHex, kp.Address(), nil

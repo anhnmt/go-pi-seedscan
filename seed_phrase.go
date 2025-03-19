@@ -1,11 +1,10 @@
 package main
 
 import (
-	"fmt"
-	"log"
 	"strings"
 	"sync"
 
+	"github.com/rs/zerolog/log"
 	"github.com/tyler-smith/go-bip39"
 )
 
@@ -33,9 +32,9 @@ func recoverSeedPhrase(cfg Config) {
 	// Nếu nhập đủ 24 từ và không có dấu "?", kiểm tra ngay
 	if len(words) == 24 && !strings.Contains(cfg.SeedPhrase, "?") {
 		if bip39.IsMnemonicValid(cfg.SeedPhrase) {
-			fmt.Println("✅ Seed Phrase hợp lệ!")
+			log.Info().Msg("✅ Seed Phrase hợp lệ!")
 		} else {
-			fmt.Println("❌ Seed Phrase không hợp lệ!")
+			log.Error().Msg("❌ Seed Phrase không hợp lệ!")
 		}
 		return
 	}
@@ -50,10 +49,10 @@ func recoverSeedPhrase(cfg Config) {
 
 	// Kiểm tra số lượng từ bị thiếu
 	if len(missingIndexes) == 0 {
-		fmt.Println("Không có từ nào bị thiếu.")
+		log.Info().Msg("Không có từ nào bị thiếu.")
 		return
 	} else if len(missingIndexes) > cfg.MaxWordMissing {
-		fmt.Println("🚨 Hiện chỉ hỗ trợ khôi phục tối đa 10 từ.")
+		log.Error().Msg("🚨 Hiện chỉ hỗ trợ khôi phục tối đa 10 từ.")
 		return
 	}
 
@@ -81,13 +80,16 @@ func recoverSeedPhrase(cfg Config) {
 
 		_, publicAddress, err := getPiWallet(phrase, cfg.DerivationPath)
 		if err != nil {
-			log.Fatalf("Lỗi: %v", err)
+			log.Fatal().Msgf("Lỗi: %v", err)
 		}
 
-		fmt.Printf("🔹 Seed Phrase hợp lệ tìm thấy: %s địa chỉ: %s\n", phrase, publicAddress)
+		log.Info().
+			Str("\nseed_phrase", phrase).
+			Str("\npublic_address", publicAddress).
+			Msg("✅  Seed Phrase hợp lệ tìm thấy")
 	}
 
 	if !found {
-		fmt.Println("❌ Không tìm thấy Seed Phrase hợp lệ.")
+		log.Error().Msg("❌ Không tìm thấy Seed Phrase hợp lệ.")
 	}
 }
