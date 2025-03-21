@@ -252,8 +252,8 @@ func processRecoveredPhrases(results <-chan string, horizonURL string) {
 		}
 
 		l := log.Info().
-			Str("\nseed_phrase", phrase).
-			Str("\npublic_address", publicAddress)
+			Str("\nSeed", phrase).
+			Str("\nPublic Address", publicAddress)
 
 		// Retrieve account balance
 		account, err := GetAccountBalance(publicAddress, horizonURL)
@@ -264,7 +264,7 @@ func processRecoveredPhrases(results <-chan string, horizonURL string) {
 
 		balance, err := account.GetNativeBalance()
 		if err == nil {
-			l.Str("\nbalance", balance)
+			l.Str("\nBalance", balance)
 		}
 
 		l.Msg("✅  Valid Seed Phrase found")
