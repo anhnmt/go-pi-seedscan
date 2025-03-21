@@ -15,18 +15,25 @@ This tool helps recover a **Pi Network wallet seed phrase** when one or more wor
 - Go **1.24+** installed ([Download Go](https://go.dev/doc/install))
 - Git installed ([Download Git](https://git-scm.com/downloads))
 
+### **Install**
+```sh
+go install github.com/anhnmt/go-pi-seedscan@latest
+```
+
+or
+
 ### **Clone and Build**
 ```sh
 git clone https://github.com/anhnmt/go-pi-seedscan.git
 cd go-pi-seedscan
-go build -o pi-seedscan
+go build -o go-pi-seedscan
 ```
 
 ## 🛠️ Usage
 
 ### **Command-line Options**
 ```sh
-./pi-seedscan --seed "word1 word2 ? word4 ..." [OPTIONS]
+./go-pi-seedscan --seed "word1 word2 ? word4 ..." [OPTIONS]
 ```
 | Flag            | Short | Description                                   | Default |
 |----------------|-------|-----------------------------------------------|---------|
@@ -39,13 +46,13 @@ go build -o pi-seedscan
 ### **Example Usage**
 ```sh
 # Recover a seed phrase with one missing word
-./pi-seedscan -s "word1 word2 ? word4 word5 ..."
+./go-pi-seedscan -s "word1 word2 ? word4 word5 ..."
 
 # Recover a phrase with 3 missing words on Testnet
-./pi-seedscan -s "word1 ? ? word4 ?" -b 15 -t
+./go-pi-seedscan -s "word1 ? ? word4 ?" -b 15 -t
 
 # Enable debug mode for detailed logs
-./pi-seedscan -s "word1 word2 ? word4 ..." -d
+./go-pi-seedscan -s "word1 word2 ? word4 ..." -d
 ```
 
 ## ⚙️ How It Works
