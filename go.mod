@@ -3,10 +3,10 @@ module github.com/anhnmt/go-pi-seedscan
 go 1.24
 
 require (
-	github.com/bytedance/sonic v1.13.1
+	github.com/bytedance/sonic v1.13.2
 	github.com/rs/zerolog v1.33.0
 	github.com/spf13/pflag v1.0.6
-	github.com/stellar/go v0.0.0-20250311234916-385ac5aca1a4
+	github.com/stellar/go v0.0.0-20250320224112-0308ff5857c7
 	github.com/tyler-smith/go-bip39 v1.1.0
 )
 
