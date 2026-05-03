@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bytedance/sonic"
@@ -21,257 +25,390 @@ import (
 	"github.com/tyler-smith/go-bip39"
 )
 
+// ─── Constants ───────────────────────────────────────────────────────────────
+
 const (
 	DefaultMainNetURL = "https://api.mainnet.minepi.com"
 	DefaultTestNetURL = "https://api.testnet.minepi.com"
+	DerivationPath    = "m/44'/314159'/0'"
+
+	MaxAPIConcurrency = 10               // max concurrent Horizon API calls
+	APITimeout        = 10 * time.Second // per-request timeout for Horizon
 )
 
-const (
-	DerivationPath = "m/44'/314159'/0'"
-)
+// ─── Config ──────────────────────────────────────────────────────────────────
 
 type Config struct {
 	SeedPhrase     string
-	DerivationPath string
 	MaxWordMissing int
-	BatchSize      int
+	Workers        int
 	Testnet        bool
 	Debug          bool
+	StopOnFirst    bool // stop after the first wallet with balance is found
 }
 
-var cfg Config
-
-func main() {
-	pflag.StringVarP(&cfg.SeedPhrase, "seed", "s", "", "Your seed phrase")
-	pflag.IntVarP(&cfg.MaxWordMissing, "max_word", "m", 5, "Max missing words allowed")
-	pflag.IntVarP(&cfg.BatchSize, "batch", "b", 10, "Batch size for processing")
+func parseConfig() Config {
+	var cfg Config
+	pflag.StringVarP(&cfg.SeedPhrase, "seed", "s", "", "Seed phrase (use ? for missing words)")
+	pflag.IntVarP(&cfg.MaxWordMissing, "max-word", "m", 5, "Max missing words allowed (0-24)")
+	pflag.IntVarP(&cfg.Workers, "workers", "w", runtime.NumCPU(), "Number of parallel workers")
 	pflag.BoolVarP(&cfg.Testnet, "testnet", "t", false, "Use Testnet instead of Mainnet")
-	pflag.BoolVarP(&cfg.Debug, "debug", "d", false, "Enable debug mode")
+	pflag.BoolVarP(&cfg.Debug, "debug", "d", false, "Enable debug logging")
+	pflag.BoolVarP(&cfg.StopOnFirst, "stop-first", "f", true, "Stop after first wallet with balance")
 	pflag.Parse()
-
-	initLogger(cfg.Debug)
-
-	if err := validateConfig(cfg); err != nil {
-		log.Fatal().Msgf("Invalid config: %v", err)
-	}
-
-	// Start seed phrase recovery process
-	RecoverSeedPhrase(cfg)
+	return cfg
 }
 
-// validateConfig checks if the required parameters are provided and valid.
 func validateConfig(cfg Config) error {
 	if cfg.SeedPhrase == "" {
-		return fmt.Errorf("seed phrase cannot be empty")
+		return fmt.Errorf("seed phrase cannot be empty (use -s)")
 	}
 	if cfg.MaxWordMissing < 0 || cfg.MaxWordMissing > 24 {
-		return fmt.Errorf("max_word must be between 0 and 24")
+		return fmt.Errorf("max-word must be between 0 and 24")
 	}
-	if cfg.BatchSize <= 0 {
-		return fmt.Errorf("batch size must be greater than 0")
+	if cfg.Workers <= 0 {
+		return fmt.Errorf("workers must be > 0")
 	}
 	return nil
 }
 
-// initLogger initializes the global logger with the specified log level and formatting.
+// ─── Logger ──────────────────────────────────────────────────────────────────
+
 func initLogger(debug bool) {
-	// Set logging level based on debug mode
 	level := zerolog.InfoLevel
 	if debug {
 		level = zerolog.DebugLevel
 	}
 	zerolog.SetGlobalLevel(level)
-
-	// Configure time format and custom JSON marshaller
 	zerolog.TimeFieldFormat = time.RFC3339
 	zerolog.InterfaceMarshalFunc = sonic.Marshal
-
-	// Customize caller output to show only the filename and line number
 	zerolog.CallerMarshalFunc = func(_ uintptr, file string, line int) string {
 		return filepath.Base(file) + ":" + strconv.Itoa(line)
 	}
-
-	// Configure the logger with console output, timestamp, and caller info
-	log.Logger = zerolog.
-		New(&zerolog.ConsoleWriter{
-			Out:        os.Stdout,
-			TimeFormat: time.RFC3339,
-			NoColor:    false,
-		}).
-		With().
-		Timestamp().
-		Caller().
-		Logger()
+	log.Logger = zerolog.New(&zerolog.ConsoleWriter{
+		Out:        os.Stdout,
+		TimeFormat: time.RFC3339,
+		NoColor:    false,
+	}).With().Timestamp().Caller().Logger()
 }
 
-// GetHorizonURL selects the appropriate Horizon API URL based on whether Testnet or Mainnet is used.
-func GetHorizonURL(testnet bool) string {
+// ─── Horizon helpers ─────────────────────────────────────────────────────────
+
+func horizonURL(testnet bool) string {
 	if testnet {
 		return DefaultTestNetURL
 	}
 	return DefaultMainNetURL
 }
 
-// GetPiWallet generates a Pi Network wallet address from a Seed Phrase with a flexible derivation path.
-func GetPiWallet(seedPhrase string) (string, error) {
-	// Generate seed from mnemonic
+// getAccountBalance fetches the account from Horizon with a context timeout.
+func getAccountBalance(ctx context.Context, address, hURL string) (*horizon.Account, error) {
+	client := horizonclient.Client{HorizonURL: hURL}
+	req := horizonclient.AccountRequest{AccountID: address}
+
+	// horizonclient doesn't accept context natively,
+	// so we wrap the call with a deadline-aware goroutine.
+	type result struct {
+		acc horizon.Account
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		acc, err := client.AccountDetail(req)
+		ch <- result{acc, err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-ch:
+		if r.err != nil {
+			return nil, r.err
+		}
+		return &r.acc, nil
+	}
+}
+
+// ─── Wallet derivation ──────────────────────────────────────────────────────
+
+func derivePiAddress(seedPhrase string) (string, error) {
 	seed := bip39.NewSeed(seedPhrase, "")
-
-	// Derive key using the specified derivation path
-	derivedKey, err := derivation.DeriveForPath(DerivationPath, seed)
+	dk, err := derivation.DeriveForPath(DerivationPath, seed)
 	if err != nil {
-		return "", errors.Wrap(err, "failed to derive key")
+		return "", errors.Wrap(err, "derive key")
 	}
-
-	// Extract the first 32 bytes as the Ed25519 seed
-	var ed25519Seed [32]byte
-	copy(ed25519Seed[:], derivedKey.Key[:32]) // Convert to [32]byte
-
-	// Generate Stellar Keypair (for Pi Network)
-	kp, err := keypair.FromRawSeed(ed25519Seed)
+	var raw [32]byte
+	copy(raw[:], dk.Key[:32])
+	kp, err := keypair.FromRawSeed(raw)
 	if err != nil {
-		return "", errors.Wrap(err, "failed to generate Stellar keypair")
+		return "", errors.Wrap(err, "keypair from seed")
 	}
-
 	return kp.Address(), nil
 }
 
-// GetAccountBalance retrieves the balance of a Stellar wallet address.
-func GetAccountBalance(address string, horizonURL string) (*horizon.Account, error) {
-	client := horizonclient.Client{HorizonURL: horizonURL}
-	accountRequest := horizonclient.AccountRequest{AccountID: address}
+// ─── BIP-39 fast checksum pre-filter ─────────────────────────────────────────
+//
+// A BIP-39 mnemonic maps to entropy + checksum.  For a 24-word (256-bit) phrase
+// the last 8 bits of the last word encode the SHA-256 checksum of the entropy.
+// We can reject ~99.6% of candidates cheaply by verifying the checksum ourselves
+// before calling the heavier bip39.IsMnemonicValid (which re-parses the string).
+//
+// wordListMap is built once at startup for O(1) word→index lookup.
 
-	// Fetch account details from Horizon API
-	account, err := client.AccountDetail(accountRequest)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch account details: %w", err)
+var (
+	wordList    []string
+	wordListMap map[string]int
+)
+
+func initWordList() {
+	wordList = bip39.GetWordList()
+	wordListMap = make(map[string]int, len(wordList))
+	for i, w := range wordList {
+		wordListMap[w] = i
 	}
-
-	return &account, nil
 }
 
-// recoverMissingWords recursively tests all possible word combinations to restore a valid Seed Phrase.
-func recoverMissingWords(words []string, missingIndexes []int, index int, wg *sync.WaitGroup, results chan<- string) {
-	// Base case: when all missing words are filled, validate the Seed Phrase
-	if index >= len(missingIndexes) {
-		testPhrase := strings.Join(words, " ")
-		if bip39.IsMnemonicValid(testPhrase) {
-			results <- testPhrase
+// fastChecksumValid converts words→entropy and validates the SHA-256 checksum
+// without string allocation.  Returns false for any unknown word.
+func fastChecksumValid(words []string) bool {
+	if len(words) != 24 {
+		return false
+	}
+
+	// 24 words × 11 bits = 264 bits = 256 entropy + 8 checksum
+	// Pack the 11-bit indices into a byte buffer (33 bytes).
+	var buf [33]byte
+	bitPos := 0
+	for _, w := range words {
+		idx, ok := wordListMap[w]
+		if !ok {
+			return false
+		}
+		// Write 11 bits of idx into buf starting at bitPos.
+		for i := 10; i >= 0; i-- {
+			byteIdx := bitPos / 8
+			bitIdx := 7 - (bitPos % 8)
+			if idx&(1<<i) != 0 {
+				buf[byteIdx] |= 1 << bitIdx
+			}
+			bitPos++
+		}
+	}
+
+	// First 32 bytes = entropy, last byte = checksum (8 bits).
+	entropy := buf[:32]
+	checksumByte := buf[32]
+
+	hash := sha256.Sum256(entropy)
+	return hash[0] == checksumByte
+}
+
+// ─── Recovery engine ─────────────────────────────────────────────────────────
+
+// recoverInner recursively fills missing positions depth-first.
+// Each goroutine owns its own `words` slice — no shared mutation.
+func recoverInner(words []string, missing []int, depth int, results chan<- string, canceled func() bool) {
+	if canceled() {
+		return
+	}
+
+	if depth >= len(missing) {
+		// All missing words filled → validate checksum fast, then full check.
+		if fastChecksumValid(words) {
+			phrase := strings.Join(words, " ")
+			// Double-check with library (handles edge cases).
+			if bip39.IsMnemonicValid(phrase) {
+				results <- phrase
+			}
 		}
 		return
 	}
 
-	// Iterate through all possible words in the BIP-39 word list
-	for _, word := range bip39.GetWordList() {
-		words[missingIndexes[index]] = word
-		recoverMissingWords(words, missingIndexes, index+1, wg, results)
+	pos := missing[depth]
+	for _, w := range wordList {
+		words[pos] = w
+		recoverInner(words, missing, depth+1, results, canceled)
+		if canceled() {
+			return
+		}
 	}
 }
 
-// RecoverSeedPhrase attempts to restore a valid Seed Phrase by filling in missing words.
+// RecoverSeedPhrase is the top-level entry point.
 func RecoverSeedPhrase(cfg Config) {
 	words := strings.Split(cfg.SeedPhrase, " ")
 
-	// If the Seed Phrase is complete (24 words) and contains no missing words, validate it immediately
+	// ── Fast path: full phrase supplied ──
 	if len(words) == 24 && !strings.Contains(cfg.SeedPhrase, "?") {
-		validateSeedPhrase(cfg.SeedPhrase)
+		if bip39.IsMnemonicValid(cfg.SeedPhrase) {
+			log.Info().Msg("✅ Valid Seed Phrase!")
+		} else {
+			log.Error().Msg("❌ Invalid Seed Phrase!")
+		}
 		return
 	}
 
-	// Identify missing word positions
-	missingIndexes := findMissingIndexes(words)
+	// ── Identify missing positions ──
+	var missing []int
+	for i, w := range words {
+		if w == "?" {
+			missing = append(missing, i)
+		}
+	}
 
-	// Validate the number of missing words
-	if !validateMissingWords(len(missingIndexes), cfg.MaxWordMissing) {
+	if len(missing) == 0 {
+		log.Info().Msg("No missing words detected.")
+		return
+	}
+	if len(missing) > cfg.MaxWordMissing {
+		log.Error().Msgf("🚨 %d missing words exceeds limit of %d.", len(missing), cfg.MaxWordMissing)
 		return
 	}
 
-	// Channel to receive valid Seed Phrases from goroutines
-	results := make(chan string, cfg.BatchSize)
+	totalCombinations := 1.0
+	for i := 0; i < len(missing); i++ {
+		totalCombinations *= float64(len(wordList))
+	}
+	log.Info().
+		Int("missing_words", len(missing)).
+		Str("combinations", fmt.Sprintf("%.0f", totalCombinations)).
+		Int("workers", cfg.Workers).
+		Msg("Starting recovery")
+
+	// ── Cancellable context for early termination ──
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	results := make(chan string, 256)
+
+	// ── Fan-out: split first missing position across workers ──
+	//
+	// Each worker gets a disjoint subset of wordList for the first missing
+	// position, so zero contention on the shared `words` slice (each worker
+	// gets its own deep copy).
 	var wg sync.WaitGroup
-	wg.Add(1)
+	chunkSize := (len(wordList) + cfg.Workers - 1) / cfg.Workers
 
-	// Start recursive recovery process
-	go func() {
-		defer wg.Done()
-		recoverMissingWords(words, missingIndexes, 0, &wg, results)
-	}()
+	for i := 0; i < cfg.Workers; i++ {
+		start := i * chunkSize
+		end := start + chunkSize
+		if end > len(wordList) {
+			end = len(wordList)
+		}
+		if start >= len(wordList) {
+			break
+		}
 
-	// Close the results channel once processing is complete
+		wg.Add(1)
+		go func(subset []string) {
+			defer wg.Done()
+			// Each goroutine gets its own copy of the words slice.
+			localWords := make([]string, len(words))
+			copy(localWords, words)
+
+			for _, firstWord := range subset {
+				if ctx.Err() != nil {
+					return
+				}
+				localWords[missing[0]] = firstWord
+				recoverInner(localWords, missing, 1, results, func() bool {
+					return ctx.Err() != nil
+				})
+			}
+		}(wordList[start:end])
+	}
+
+	// Close results channel when all workers finish.
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// Process the recovered Seed Phrases
-	processRecoveredPhrases(results, GetHorizonURL(cfg.Testnet))
+	// ── Process results with bounded API concurrency ──
+	processResults(ctx, cancel, results, horizonURL(cfg.Testnet), cfg.StopOnFirst)
 }
 
-// validateSeedPhrase checks if the given Seed Phrase is valid.
-func validateSeedPhrase(seedPhrase string) {
-	if bip39.IsMnemonicValid(seedPhrase) {
-		log.Info().Msg("✅ Valid Seed Phrase!")
-	} else {
-		log.Error().Msg("❌ Invalid Seed Phrase!")
-	}
-}
-
-// findMissingIndexes returns the indexes of missing words in the Seed Phrase.
-func findMissingIndexes(words []string) []int {
-	var missingIndexes []int
-	for i, word := range words {
-		if word == "?" {
-			missingIndexes = append(missingIndexes, i)
-		}
-	}
-	return missingIndexes
-}
-
-// validateMissingWords checks if the number of missing words is within the allowed limit.
-func validateMissingWords(missingCount, maxAllowed int) bool {
-	switch {
-	case missingCount == 0:
-		log.Info().Msg("No missing words detected.")
-		return false
-	case missingCount > maxAllowed:
-		log.Error().Msgf("🚨 Only up to %d missing words can be recovered.", maxAllowed)
-		return false
-	}
-	return true
-}
-
-// processRecoveredPhrases handles the recovered Seed Phrases and checks their account balance.
-func processRecoveredPhrases(results <-chan string, horizonURL string) {
-	found := false
+// processResults reads valid phrases from the channel and checks their balance
+// with bounded concurrency and optional early termination.
+func processResults(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	results <-chan string,
+	hURL string,
+	stopOnFirst bool,
+) {
+	sem := make(chan struct{}, MaxAPIConcurrency)
+	var found atomic.Bool
+	var mu sync.Mutex
+	var wgAPI sync.WaitGroup
 
 	for phrase := range results {
-		publicAddress, err := GetPiWallet(phrase)
-		if err != nil {
-			log.Error().Msgf("Error in GetPiWallet: %v", err)
-			continue
+		if ctx.Err() != nil {
+			break
 		}
 
-		l := log.Info().
-			Str("\nSeed", phrase).
-			Str("\nPublic Address", publicAddress)
+		sem <- struct{}{} // acquire slot
+		wgAPI.Add(1)
+		go func(p string) {
+			defer wgAPI.Done()
+			defer func() { <-sem }() // release slot
 
-		// Retrieve account balance
-		account, err := GetAccountBalance(publicAddress, horizonURL)
-		if err != nil {
-			log.Debug().Err(err).Msg("Error in GetAccountBalance")
-			continue
-		}
+			if ctx.Err() != nil {
+				return
+			}
 
-		balance, err := account.GetNativeBalance()
-		if err == nil {
-			l.Str("\nBalance", balance)
-		}
+			addr, err := derivePiAddress(p)
+			if err != nil {
+				log.Error().Err(err).Msg("derivePiAddress failed")
+				return
+			}
 
-		l.Msg("✅  Valid Seed Phrase found")
-		found = true
+			reqCtx, reqCancel := context.WithTimeout(ctx, APITimeout)
+			defer reqCancel()
+
+			account, err := getAccountBalance(reqCtx, addr, hURL)
+			if err != nil {
+				log.Debug().Err(err).Str("address", addr).Msg("balance check skipped")
+				return
+			}
+
+			balance, _ := account.GetNativeBalance()
+
+			mu.Lock()
+			log.Info().
+				Str("seed", p).
+				Str("address", addr).
+				Str("balance", balance).
+				Msg("✅ Valid Seed Phrase with active account")
+			mu.Unlock()
+
+			found.Store(true)
+			if stopOnFirst {
+				cancel() // signal all workers to stop
+			}
+		}(phrase)
 	}
 
-	if !found {
-		log.Error().Msg("❌  No valid Seed Phrase found.")
+	wgAPI.Wait()
+
+	if !found.Load() {
+		log.Error().Msg("❌ No valid Seed Phrase with active account found.")
 	}
+}
+
+// ─── Main ────────────────────────────────────────────────────────────────────
+
+func main() {
+	cfg := parseConfig()
+	initLogger(cfg.Debug)
+
+	if err := validateConfig(cfg); err != nil {
+		log.Fatal().Err(err).Msg("invalid config")
+	}
+
+	initWordList() // build word→index map once
+	start := time.Now()
+
+	RecoverSeedPhrase(cfg)
+
+	log.Info().Dur("elapsed", time.Since(start)).Msg("Done")
 }
