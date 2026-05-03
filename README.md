@@ -1,100 +1,109 @@
-# Pi Wallet Seed Phrase Recovery Tool
+# go-pi-seedscan
 
-This tool helps recover a **Pi Network wallet seed phrase** when one or more words are missing. It attempts to reconstruct the correct mnemonic by testing possible word combinations.
+Recover missing words in a **Pi Network** wallet seed phrase. The tool brute-forces unknown positions using BIP-39 validation, then verifies recovered wallets against the Pi Horizon API.
 
-## 🚀 Features
-- Supports recovery of up to **10 missing words** (customizable).
-- Uses the **BIP-39 standard** for mnemonic validation.
-- Works with **Pi Network's Horizon API** to check account balance.
-- Supports both **Testnet** and **Mainnet**.
-- High-performance parallel processing with **Go routines**.
+## How it works
 
-## 📥 Installation
+1. You supply your 24-word seed phrase with `?` in place of each missing word.
+2. The tool fans out across all CPU cores, testing every BIP-39 word at each `?` position.
+3. A fast SHA-256 checksum pre-filter discards ~99.6 % of invalid candidates before full validation.
+4. Each valid mnemonic is derived into a Pi wallet address and checked on-chain for an active account.
 
-### **Prerequisites**
-- Go **1.24+** installed ([Download Go](https://go.dev/doc/install))
-- Git installed ([Download Git](https://git-scm.com/downloads))
+> **Performance note** — 1 missing word (2 048 candidates) completes in under a second. 2 missing words (~4 M) takes seconds. Each additional word multiplies the search space by 2 048×, so 3+ missing words can take a long time.
 
-### **Install**
+## Installation
+
+**Requirements:** Go 1.26+
+
 ```sh
 go install github.com/anhnmt/go-pi-seedscan@latest
 ```
 
-or
+Or build from source:
 
-### **Clone and Build**
 ```sh
 git clone https://github.com/anhnmt/go-pi-seedscan.git
 cd go-pi-seedscan
 go build -o go-pi-seedscan
 ```
 
-## 🛠️ Usage
+## Usage
 
-### **Command-line Options**
 ```sh
-./go-pi-seedscan --seed "word1 word2 ? word4 ..." [OPTIONS]
+./go-pi-seedscan -s "word1 word2 ? word4 ... word24"
 ```
-| Flag            | Short | Description                                   | Default |
-|----------------|-------|-----------------------------------------------|---------|
-| `--seed`       | `-s`  | Seed phrase with missing words (`?` as placeholder). | **(Required)** |
-| `--max_word`   | `-m`  | Maximum number of missing words to recover.   | `5`     |
-| `--batch`      | `-b`  | Batch size for processing combinations.       | `10`    |
-| `--testnet`    | `-t`  | Use Pi Testnet instead of Mainnet.           | `false` |
-| `--debug`      | `-d`  | Enable debug mode for more logs.              | `false` |
 
-### **Example Usage**
+### Flags
+
+| Flag | Short | Default | Description |
+|---|---|---|---|
+| `--seed` | `-s` | *(required)* | Seed phrase — use `?` for each missing word |
+| `--max-word` | `-m` | `5` | Maximum missing words allowed |
+| `--workers` | `-w` | CPU cores | Parallel worker count |
+| `--testnet` | `-t` | `false` | Query Testnet instead of Mainnet |
+| `--stop-first` | `-f` | `true` | Stop after the first wallet with balance is found |
+| `--debug` | `-d` | `false` | Verbose logging |
+
+### Examples
+
 ```sh
-# Recover a seed phrase with one missing word
-./go-pi-seedscan -s "word1 word2 ? word4 word5 ..."
+# One missing word
+./go-pi-seedscan -s "word1 word2 ? word4 word5 ... word24"
 
-# Recover a phrase with 3 missing words on Testnet
-./go-pi-seedscan -s "word1 ? ? word4 ?" -b 15 -t
+# Three missing words on Testnet, 16 workers
+./go-pi-seedscan -s "word1 ? ? word4 ? word6 ... word24" -t -w 16
 
-# Enable debug mode for detailed logs
-./go-pi-seedscan -s "word1 word2 ? word4 ..." -d
+# Validate a complete phrase (no ? present)
+./go-pi-seedscan -s "word1 word2 word3 ... word24"
 ```
 
-## ⚙️ How It Works
-1. **Splits the seed phrase** into individual words.
-2. **Identifies missing positions** marked by `?`.
-3. **Recursively tests** all possible words in those positions.
-4. **Validates each phrase** using the **BIP-39 standard**.
-5. **Checks account balance** on Pi Network's blockchain.
-
-## 📜 Example Output
+### Example output
 
 ```
-✅ Valid Seed Phrase found
-Seed=word1 word2 word3 word4 ... word24
-Public Address=GBJ2HPQXWQNEMYRXEZIXYSUUM7SBDGFR5EYP3CNGNGSXXQHARCSKF2CY
-Balance=314.159265 Pi
+12:00:00 INF Starting recovery missing_words=1 combinations=2048 workers=8
+12:00:01 INF ✅ Valid Seed Phrase with active account
+         seed=word1 word2 word3 ... word24
+         address=GBJ2HPQXWQNEMYRXEZIXYSUUM7SBDGFR5EYP3CNGNGSXXQHARCSKF2CY
+         balance=314.159265
+12:00:01 INF Done elapsed=1.23s
 ```
 
-## 🏗️ Development & Contribution
+## Architecture
 
-### **1️⃣ Clone the Repository**
+```
+main
+ ├─ initWordList()          build word→index map once (O(1) lookups)
+ ├─ RecoverSeedPhrase()
+ │   ├─ fan-out             split wordList across N workers
+ │   │   └─ recoverInner()  recursive depth-first search (own slice copy)
+ │   │       └─ fastChecksumValid()  SHA-256 checksum pre-filter
+ │   └─ processResults()
+ │       └─ bounded API pool (10 concurrent Horizon requests, 10 s timeout)
+ └─ context.WithCancel      early termination on first hit
+```
+
+Key design decisions:
+
+- **No shared mutable state** — each worker deep-copies the word slice, eliminating data races.
+- **Checksum pre-filter** — converts words→entropy bits and verifies the SHA-256 checksum directly, avoiding string allocation and full mnemonic parsing for invalid candidates.
+- **Bounded API concurrency** — at most 10 in-flight Horizon requests with per-request timeouts prevent rate-limiting and hangs.
+- **Early termination** — `context.WithCancel` propagates to all workers when `--stop-first` is set.
+
+## Contributing
+
 ```sh
 git clone https://github.com/anhnmt/go-pi-seedscan.git
 cd go-pi-seedscan
-```
-
-### **2️⃣ Install Dependencies**
-```sh
 go mod tidy
-```
-
-### **3️⃣ Run in Debug Mode**
-```sh
 go run main.go -s "word1 word2 ? word4 ..." -d
 ```
 
-### **4️⃣ Contribute**
-- **Report bugs** via [GitHub Issues](https://github.com/anhnmt/go-pi-seedscan/issues).
-- **Submit a Pull Request (PR)** for improvements.
+Bug reports and PRs welcome via [GitHub Issues](https://github.com/anhnmt/go-pi-seedscan/issues).
 
-## ⚠️ Disclaimer
-This tool is provided **as is**, and the authors are **not responsible** for any loss of funds. Always **backup your seed phrase securely**.
+## Disclaimer
 
-## 📜 License
-This project is licensed under the **MIT License**. See [`LICENSE`](./LICENSE) for details.  
+This tool is provided as-is. The authors are not responsible for any loss of funds. Always store your seed phrase securely offline.
+
+## License
+
+[MIT](./LICENSE)
